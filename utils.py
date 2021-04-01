@@ -1,5 +1,6 @@
 import os
 import datetime
+import numpy as np
 
 current_time = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
 PARAMS = {'mnist_fashion'     :{'epochs':25, 'batch_size':32, 'num_classes':10},
@@ -76,3 +77,19 @@ class AverageMeter(object):
         if self.count > 0:
             self.avg = self.sum / self.count
         self.percentage = self.avg*100
+
+# Save index of whole sorted data
+class SortedMeter(object):
+    def __init__(self, num):
+        self.sorted = np.zeros(num)
+        self.pivot = 0
+
+    def update(self, arr):
+        new_pivot = self.pivot + len(arr)
+        self.sorted[self.pivot : new_pivot] = arr
+        self.pivot = new_pivot
+
+    def sort(self):
+        self.index = np.argsort(self.sorted)
+
+

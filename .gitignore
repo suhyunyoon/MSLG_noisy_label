@@ -36,3 +36,4 @@ clothing1M50k/models/
 *.rar
 *.zip
 tmp.*
+*.npy

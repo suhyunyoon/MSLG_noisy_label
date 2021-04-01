@@ -7,9 +7,12 @@ from collections import OrderedDict
 import itertools
 import gc
 
-from dataset import get_data, get_dataloader, get_synthetic_idx, DATASETS_BIG, DATASETS_SMALL
+from dataset import get_data, get_dataloader, get_synthetic_idx, get_cm, DATASETS_BIG, DATASETS_SMALL
 from model_getter import get_model
 from utils import *
+from baseline_losses import *
+import matplotlib
+matplotlib.use('Agg')
 
 # pytorch imports
 import torch
@@ -30,7 +33,8 @@ PARAMS_META = {'mnist_fashion'     :{'alpha':0.5, 'beta':4000, 'gamma':1, 'stage
                'clothing1Mbalanced':{'alpha':0.5, 'beta':1500, 'gamma':1, 'stage1':1, 'stage2':10, 'k':10},
                'food101N'          :{'alpha':0.5, 'beta':1500, 'gamma':1, 'stage1':1, 'stage2':10, 'k':10}}
 
-def metapencil(alpha, beta, gamma, stage1, stage2, K):
+def metapencil(alpha, beta, gamma, stage1, stage2, K, criterion='cross_entropy'):
+    # traditional SGD
     def warmup_training():
         loss = criterion_cce(output, labels)
         optimizer.zero_grad()
@@ -38,6 +42,7 @@ def metapencil(alpha, beta, gamma, stage1, stage2, K):
         optimizer.step()
         return loss
 
+    # meta-learning with soft labels
     def meta_training():
         # meta training for predicted labels
         y_softmaxed = softmax(yy)
@@ -69,18 +74,42 @@ def metapencil(alpha, beta, gamma, stage1, stage2, K):
         optimizer.step()
         
         return loss, meta_grads
-
-    print('use_clean:{}, alpha:{}, beta:{}, gamma:{}, stage1:{}, stage2:{}, K:{}'.format(use_clean_data, alpha, beta, gamma, stage1, stage2, K))
+    
+    print('use_clean:{}, alpha:{}, beta:{}, gamma:{}, stage1:{}, stage2:{}, K:{}, loss:{}'.format(use_clean_data, alpha, beta, gamma, stage1, stage2, K, criterion))
 
     NUM_TRAINDATA = len(train_dataset)
     t_dataset, m_dataset, t_dataloader, m_dataloader = train_dataset, meta_dataset, train_dataloader, meta_dataloader
+
     # loss functions
-    criterion_cce = nn.CrossEntropyLoss()
+    if criterion == 'cross_entropy':
+        criterion_cce = nn.CrossEntropyLoss()
+        criterion_cce_each = nn.CrossEntropyLoss(reduction="none")
+    elif criterion == 'symmetric_crossentropy':
+        criterion_cce = symmetric_crossentropy(NUM_CLASSES)
+        criterion_cce_each = symmetric_crossentropy(NUM_CLASSES, reduction='none')
+    elif criterion == 'generalized_crossentropy':
+        criterion_cce = generalized_crossentropy(NUM_CLASSES)
+        criterion_cce_each = generalized_crossentropy(NUM_CLASSES, reduction='none')
+    elif criterion == 'bootstrap_soft':
+        criterion_cce = bootstrap_soft(NUM_CLASSES)
+        criterion_cce_each = bootstrap_soft(NUM_CLASSES, reduction='none')
+    elif criterion == 'forwardloss':
+        P = torch.tensor(get_cm(dataset, noise_type, noise_ratio,framework), dtype=torch.float).to(device)
+        loss_object = nn.CrossEntropyLoss(reduction='none')
+        criterion_cce = forwardloss(P, loss_object)
+        criterion_cce_each = forwardloss(P, loss_object, reduction='none')
+    elif criterion == 'joint_optimization':
+        p = np.ones(NUM_CLASSES, dtype=np.float32) / float(NUM_CLASSES)
+        p = torch.tensor(p, dtype=torch.float).to(device)
+        criterion_cce = joint_optimization(p)
+        criterion_cce_each = joint_optimization(p, reduction='none')
+
     criterion_meta = lambda output, labels: torch.mean(softmax(output)*(logsoftmax(output+1e-10)-torch.log(labels+1e-10)))
 
     # initialize predicted labels with given labels multiplied with a constant
     y_init_path = '{}/y_{}_{}_{}_{}.npy'.format(dataset,noise_type,noise_ratio,NUM_TRAINDATA,stage1)
     labels_yy = np.zeros(NUM_TRAINDATA)
+    # load labels
     if not os.path.exists(y_init_path):
         new_y = np.zeros([NUM_TRAINDATA,NUM_CLASSES])
         for batch_idx, (images, labels) in enumerate(t_dataloader):
@@ -96,11 +125,13 @@ def metapencil(alpha, beta, gamma, stage1, stage2, K):
     top5_acc_best = 0
     top1_acc_best = 0
     epoch_best = 0
-
+    
+    # load model
     model_s1_path = '{}/{}_{}_{}_{}_{}.pt'.format(dataset,dataset,noise_type,noise_ratio,NUM_TRAINDATA,stage1)
     if os.path.exists(model_s1_path):
         net.load_state_dict(torch.load(model_s1_path, map_location=device))
-
+    
+    # stage1, stage2
     for epoch in range(stage2): 
         start_epoch = time.time()
         train_accuracy = AverageMeter()
@@ -108,16 +139,29 @@ def metapencil(alpha, beta, gamma, stage1, stage2, K):
         train_accuracy_meta = AverageMeter()
         label_similarity = AverageMeter()
 
+        clean_accuracy = AverageMeter()
+        noisy_accuracy = AverageMeter()
+        clean_norm = AverageMeter()
+        noisy_norm = AverageMeter()
+        clean_logit_max = AverageMeter()
+        noisy_logit_max = AverageMeter()
+
+        norm_sorted = SortedMeter(NUM_TRAINDATA)
+        confidence_sorted = SortedMeter(NUM_TRAINDATA)
+        loss_sorted = SortedMeter(NUM_TRAINDATA)
+
         lr = lr_scheduler(epoch)
         set_learningrate(optimizer, lr)
         net.train()
         grads_dict = OrderedDict((name, 0) for (name, param) in net.named_parameters()) 
-
+        
         # skip straightforward training if there is a pretrained model already
         if os.path.exists(model_s1_path) and epoch < stage1:
             continue
+        
         # if no use clean data, extract reliable data for meta subset
         if epoch == stage1:
+            # save model when epoch reaches stage1
             if not os.path.exists(model_s1_path):
                 torch.save(net.cpu().state_dict(), model_s1_path)
                 net.to(device)            
@@ -131,9 +175,12 @@ def metapencil(alpha, beta, gamma, stage1, stage2, K):
                     onehot = torch.zeros(labels.size(0), NUM_CLASSES).scatter_(1, labels.view(-1, 1), K).cpu().numpy()
                     new_y[index, :] = onehot
             t_meta_loader_iter = iter(m_dataloader)
+        
         y_hat = new_y.copy()
         meta_grads_yy_log = np.zeros((NUM_TRAINDATA,NUM_CLASSES))
-
+        #noisy_idx_tensor = torch.BoolTensor(noisy_idx)
+        
+        # Batch Processing    
         for batch_idx, (images, labels) in enumerate(t_dataloader):
             start = time.time()
             index = np.arange(batch_idx*BATCH_SIZE, (batch_idx)*BATCH_SIZE+labels.size(0))
@@ -150,6 +197,8 @@ def metapencil(alpha, beta, gamma, stage1, stage2, K):
 
             if epoch < stage1:
                 loss = warmup_training()
+                loss_each = criterion_cce_each(output, labels).cpu()
+            
             else:
                 # meta training images and labels
                 try:
@@ -165,10 +214,39 @@ def metapencil(alpha, beta, gamma, stage1, stage2, K):
                 #with torch.autograd.detect_anomaly():
                 loss, meta_grads_yy = meta_training()
                 meta_grads_yy_log[index] = meta_grads_yy.cpu().detach().numpy()
-
+            
             _, labels_yy[index] = torch.max(yy.cpu(), 1)
             _, predicted = torch.max(output.data, 1)
-            train_accuracy.update(predicted.eq(labels.data).cpu().sum().item(), labels.size(0)) 
+            
+            # Accuracy of train, noisy and clean data
+            predicted_eq = predicted.eq(labels.data).cpu()
+            train_accuracy.update(predicted_eq.sum().item(), labels.size(0)) 
+            
+            noisy_num = noisy_idx[index].sum()
+            clean_num = (noisy_idx[index] == False).sum()
+            noisy_accuracy.update(predicted_eq[noisy_idx[index]].sum().item(), noisy_num)
+            clean_accuracy.update(predicted_eq[noisy_idx[index] == False].sum().item(), clean_num) 
+            
+            # Norm
+            output_norm = output.norm(dim=1).cpu()
+            noisy_norm.update(output_norm[noisy_idx[index]].sum().item(), noisy_num)
+            clean_norm.update(output_norm[noisy_idx[index] == False].sum().item(), clean_num)
+            # Norm List
+            norm_sorted.update(output_norm.detach().numpy())
+
+            # Logit Max (confidence)
+            logit_max = torch.amax(softmax(output), dim=1).cpu()
+            noisy_logit_max.update(logit_max[noisy_idx[index]].sum().item(), noisy_num)
+            clean_logit_max.update(logit_max[noisy_idx[index] == False].sum().item(), clean_num)
+            # Confidence List
+            confidence_sorted.update(logit_max.detach().numpy())
+
+            # Lowest Loss
+            loss_sorted.update(loss_each.detach().numpy())
+
+#print(predicted.eq(labels.data).cpu().sum().item)
+#           print(labels.size(0))
+
             train_loss.update(loss.item())
             train_accuracy_meta.update(predicted.eq(torch.tensor(labels_yy[index]).to(device)).cpu().sum().item(), predicted.size(0)) 
             label_similarity.update(labels.eq(torch.tensor(labels_yy[index]).to(device)).cpu().sum().item(), labels.size(0))
@@ -208,6 +286,34 @@ def metapencil(alpha, beta, gamma, stage1, stage2, K):
             summary_writer.add_scalar('val_accuracy_best', val_acc_best, epoch)
             summary_writer.add_scalar('label_similarity', label_similarity.percentage, epoch)
             summary_writer.add_figure('confusion_matrix', plot_confusion_matrix(net, test_dataloader), epoch)
+           
+            summary_writer.add_scalar('noisy_accuracy', noisy_accuracy.percentage, epoch)
+            summary_writer.add_scalar('clean_accuracy', clean_accuracy.percentage, epoch)
+            summary_writer.add_scalar('noisy_norm', noisy_norm.avg, epoch)
+            summary_writer.add_scalar('clean_norm', clean_norm.avg, epoch)
+            summary_writer.add_scalar('noisy_logit_max', noisy_logit_max.avg, epoch)
+            summary_writer.add_scalar('clean_logit_max', clean_logit_max.avg, epoch)
+            
+            # extract from sorted values
+            norm_sorted.sort()
+            highest_norm_index = norm_sorted.index[-NUM_METADATA:]
+            summary_writer.add_scalar('highest_norm_noisy_ratio', noisy_idx[highest_norm_index].sum() / NUM_METADATA * 100, epoch)
+            lowest_norm_index = norm_sorted.index[:NUM_METADATA]
+            summary_writer.add_scalar('lowest_norm_noisy_ratio', noisy_idx[lowest_norm_index].sum() / NUM_METADATA * 100, epoch)
+            
+            confidence_sorted.sort()
+            highest_confidence_index = confidence_sorted.index[-NUM_METADATA:]
+            summary_writer.add_scalar('highest_confidence_noisy_ratio', noisy_idx[highest_confidence_index].sum() / NUM_METADATA * 100, epoch)
+            lowest_confidence_index = confidence_sorted.index[:NUM_METADATA]
+            summary_writer.add_scalar('lowest_confidence_noisy_ratio', noisy_idx[lowest_confidence_index].sum() / NUM_METADATA * 100, epoch)
+         
+            loss_sorted.sort()
+#highest_loss_index = loss_sorted.index[-NUM_METADATA:]
+#summary_writer.add_scalar('highest_loss_noisy_ratio', noisy_idx[highest_loss_index].sum() / NUM_METADATA * 100, epoch)
+            lowest_loss_index = loss_sorted.index[:NUM_METADATA]
+            summary_writer.add_scalar('lowest_loss_noisy_ratio', noisy_idx[lowest_loss_index].sum() / NUM_METADATA * 100, epoch)
+
+
             if np.count_nonzero(meta_grads_yy_log) > 0:
                 summary_writer.add_histogram('meta_labels', labels_yy, epoch)
                 summary_writer.add_histogram('grads_yy_meta', get_topk(meta_grads_yy_log), epoch)
@@ -217,22 +323,24 @@ def metapencil(alpha, beta, gamma, stage1, stage2, K):
                 summary_writer.add_figure('min_grads', image_grid(idx_min_grad, t_dataset, meta_grads_yy_log), epoch)
             #for tag, parm in net.named_parameters():
             #    summary_writer.add_histogram('grads_'+tag, grads_dict[tag], epoch)
+
             if not (noisy_idx is None) and epoch >= stage1 and epoch < stage2:
                 num_noisy = np.sum(noisy_idx)
                 max_grad_idx = np.argsort(meta_grads_yy_log.max(axis=1))[-num_noisy:]
                 num_match = np.sum(noisy_idx[max_grad_idx] == 1)
                 similarity = (num_match / num_noisy)*100
-
+    
                 grad_directions = np.argmax(meta_grads_yy_log, axis=1)
                 num_true_direction = np.sum(grad_directions == clean_labels)
                 true_similarity = (num_true_direction / clean_labels.shape[0])*100
-
+ 
                 hard_labels = np.argmax(new_y, axis=1)
                 num_true_pred = np.sum(hard_labels == clean_labels)
                 pred_similarity = (num_true_pred / clean_labels.shape[0])*100
 
                 #print("Gradients in compliance with synthetic noisy data and true data: {:4.1f}%-{:4.1f}%".format(similarity,true_similarity))
                 #print("Correct label percentage: {:4.1f}%".format(pred_similarity))
+
                 summary_writer.add_scalar('compliance_grad_noisydata', similarity, epoch)
                 summary_writer.add_scalar('compliance_grad_cleandata', true_similarity, epoch)
                 summary_writer.add_scalar('compliance_pred_cleandata', pred_similarity, epoch)
@@ -437,6 +545,8 @@ if __name__ == "__main__":
         help="Epoch num to end stage2 (meta training)")
     parser.add_argument('-k', required=False, type=int, default=10,
         help="")
+    parser.add_argument('-l', '--loss', required=False, type=str, default='cross_entropy',
+        help="Loss Function")
 
     args = parser.parse_args()
     #set default variables if they are not given from the command line
@@ -498,7 +608,7 @@ if __name__ == "__main__":
     # if logging
     if SAVE_LOGS == 1:
         base_folder = model_name if dataset in DATASETS_BIG else noise_type + '/' + str(args.noise_ratio) + '/' + model_name
-        log_folder = args.folder_log if args.folder_log else 'c{}_a{}_b{}_g{}_s{}_m{}_{}'.format(use_clean_data, args.alpha, args.beta, args.gamma, args.stage1, NUM_METADATA, current_time)
+        log_folder = args.folder_log if args.folder_log else 'c{}_a{}_b{}_g{}_s1{}_s2{}_m{}_{}_{}'.format(use_clean_data, args.alpha, args.beta, args.gamma, args.stage1, args.stage2, NUM_METADATA, args.loss, current_time)
         log_base = '{}/logs/{}/'.format(dataset, base_folder)
         log_dir = log_base + log_folder + '/'
         log_dir_hp = '{}/logs_hp/{}/'.format(dataset, base_folder)
@@ -508,5 +618,5 @@ if __name__ == "__main__":
         hp_writer = SummaryWriter(log_dir_hp)
     
     start_train = time.time()
-    metapencil(args.alpha, args.beta, args.gamma, args.stage1, args.stage2, args.k)
+    metapencil(args.alpha, args.beta, args.gamma, args.stage1, args.stage2, args.k, args.loss)
     print('Total training duration: {:3.2f}h'.format((time.time()-start_train)/3600))
