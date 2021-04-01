@@ -553,6 +553,8 @@ if __name__ == "__main__":
         help="")
     parser.add_argument('-l', '--loss', required=False, type=str, default='cross_entropy',
         help="Loss Function")
+    parser.add_argument('-lr', '--lr', required=False, type=float, default=None,
+        help="learning rate")
 
     args = parser.parse_args()
     #set default variables if they are not given from the command line
@@ -602,7 +604,10 @@ if __name__ == "__main__":
     net = get_model(dataset,framework).to(device)
     if (device.type == 'cuda') and (ngpu > 1):
         net = nn.DataParallel(net, list(range(ngpu)))
-    lr_scheduler = get_lr_scheduler(dataset)
+    if args.lr == None:
+        lr_scheduler = get_lr_scheduler(dataset)
+    else :
+        lr_scheduler = lambda x : args.lr
     optimizer = optim.SGD(net.parameters(), lr=lr_scheduler(0), momentum=0.9, weight_decay=1e-4)
     logsoftmax = nn.LogSoftmax(dim=1).to(device)
     softmax = nn.Softmax(dim=1).to(device)
