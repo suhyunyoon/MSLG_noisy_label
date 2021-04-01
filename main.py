@@ -313,7 +313,13 @@ def metapencil(alpha, beta, gamma, stage1, stage2, K, criterion='cross_entropy')
             lowest_loss_index = loss_sorted.index[:NUM_METADATA]
             summary_writer.add_scalar('lowest_loss_noisy_ratio', noisy_idx[lowest_loss_index].sum() / NUM_METADATA * 100, epoch)
 
-
+            summary_writer.add_histogram('loss_histogram_noisy', loss_sorted.sorted[noisy_idx], epoch)
+            summary_writer.add_histogram('loss_histogram_clean', loss_sorted.sorted[noisy_idx==False], epoch)
+            summary_writer.add_histogram('confidence_histogram_noisy', confidence_sorted.sorted[noisy_idx], epoch)
+            summary_writer.add_histogram('confidence_histogram_clean', confidence_sorted.sorted[noisy_idx==False], epoch)
+            summary_writer.add_histogram('norm_histogram_noisy', norm_sorted.sorted[noisy_idx], epoch)
+            summary_writer.add_histogram('norm_histogram_clean', norm_sorted.sorted[noisy_idx==False], epoch)
+ 
             if np.count_nonzero(meta_grads_yy_log) > 0:
                 summary_writer.add_histogram('meta_labels', labels_yy, epoch)
                 summary_writer.add_histogram('grads_yy_meta', get_topk(meta_grads_yy_log), epoch)
