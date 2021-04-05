@@ -320,6 +320,12 @@ def get_cm(dataset_name, noise_type, noise_ratio, framework=None):
         P /= P.sum(axis=1)
     return P
 
+def get_noisy_idx(dataset_name, seed, num_metadata, num_validation, noise_type, y_noisy):
+    if dataset_name in DATASETS_SMALL:
+         _, y_clean, _, _, _, _, _, _, _ = get_smalldata(dataset_name,seed,num_metadata,num_validation,noise_type, 0)
+         return y_clean != y_noisy, y_clean
+    return None, None
+
 def get_synthetic_idx(dataset_name,seed,num_metadata,num_validation,noise_type,noise_ratio):
     if dataset_name in DATASETS_SMALL:
         _, y_clean, _, _, _, _, _, _, _ = get_smalldata(dataset_name,seed,num_metadata,num_validation,noise_type, 0)
