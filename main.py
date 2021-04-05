@@ -404,14 +404,17 @@ def get_psuedo_clean(criterion):
     prob = gmm.predict_proba(loss_each.reshape(-1,1))
     psuedo_clean_idx = prob[:,0] > np.max(prob[:,0]) - 0.04
     META_NUM = psuedo_clean_idx.sum()
-    print('clean: ',META_NUM)
-    if META_NUM > 4500:
-        psuedo_clean_idx = sorted_idx[:4500]
-        META_NUM = 4500
 
     # split psuedo clean data
-    idx_train = np.invert(psuedo_clean_idx)
-    idx_meta = psuedo_clean_idx
+    print('clean: ',META_NUM)
+    if META_NUM > 4500:
+        idx_meta = sorted_idx[:4500]
+        idx_train = sorted_idx[4500:]
+        META_NUM = 4500
+    else :
+        idx_meta = psuedo_clean_idx
+        idx_train = np.invert(psuedo_clean_idx)
+
     t_dataset = torch.utils.data.Subset(train_dataset, idx_train)
     m_dataset = torch.utils.data.Subset(train_dataset, idx_meta)
 
@@ -420,7 +423,7 @@ def get_psuedo_clean(criterion):
         transforms.RandomResizedCrop(32),
         transforms.RandomRotation(degrees=(-90, 90))
     ])
-
+    #print(len(t_dataset), len(m_dataset))
     t_dataloader = torch.utils.data.DataLoader(t_dataset,batch_size=BATCH_SIZE,shuffle=False, num_workers=num_workers)
     m_dataloader = torch.utils.data.DataLoader(m_dataset,batch_size=BATCH_SIZE,shuffle=False, num_workers=num_workers, drop_last=True)
 
