@@ -12,7 +12,7 @@ from model_getter import get_model
 from utils import *
 from baseline_losses import *
 import matplotlib
-#matplotlib.use('Agg')
+matplotlib.use('Agg')
 
 # pytorch imports
 import torch
