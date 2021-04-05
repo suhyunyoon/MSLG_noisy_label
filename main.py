@@ -7,7 +7,7 @@ from collections import OrderedDict
 import itertools
 import gc
 
-from dataset import get_data, get_dataloader, get_noisy_idx, get_synthetic_idx, get_cm, DATASETS_BIG, DATASETS_SMALL
+from dataset import get_data, get_dataloader, get_smalldata_transform_func, get_noisy_idx, get_synthetic_idx, get_cm, DATASETS_BIG, DATASETS_SMALL
 from model_getter import get_model
 from utils import *
 from baseline_losses import *
@@ -170,10 +170,10 @@ def metapencil(alpha, beta, gamma, stage1, stage2, K, criterion='cross_entropy')
                 net.to(device)            
             
             if use_clean_data == 0:
-                gt_dataset, m_dataset, t_dataloader, m_dataloader, train_idx = get_psuedo_clean(criterion_cce_each)
+#t_dataset, m_dataset, t_dataloader, m_dataloader, train_idx = get_psuedo_clean(criterion_cce_each)
                 # plotting variables
                 #noisy_idx, clean_labels = noisy_idx[train_idx], clean_labels[train_idx]
-                #t_dataset, m_dataset, t_dataloader, m_dataloader = get_dataloaders_meta()
+                t_dataset, m_dataset, t_dataloader, m_dataloader = get_dataloaders_meta()
                 NUM_TRAINDATA = len(t_dataset)
                 labels_yy = np.zeros(NUM_TRAINDATA)
                 new_y = np.zeros([NUM_TRAINDATA,NUM_CLASSES])
@@ -386,49 +386,63 @@ def metapencil(alpha, beta, gamma, stage1, stage2, K, criterion='cross_entropy')
                               {'val_accuracy': val_acc_best, 'test_accuracy': test_acc_best, 'top5_acc':top5_acc_best, 'top1_acc':top1_acc_best, 'epoch_best':epoch_best})
         hp_writer.close()
         torch.save(net.state_dict(), os.path.join(log_dir, 'saved_model.pt'))
-
+'''
 def get_psuedo_clean(criterion):
-    NUM_TRAIN_DATA = len(train_dataset)
-    loss_each = np.zeros(NUM_TRAIN_DATA)
+    NUM_TRAINDATA = len(train_dataset)
+    loss_values = np.zeros(NUM_TRAINDATA)
+    label_values = np.zeros(NUM_TRAINDATA)
+    idx_meta = None
+
     with torch.no_grad():
         for batch_idx, (images, labels) in enumerate(train_dataloader):
             images, labels = images.to(device), labels.to(device)
             index = np.arange(batch_idx*BATCH_SIZE, (batch_idx)*BATCH_SIZE+labels.size(0))
             output = net(images)
             loss = criterion(output, labels)
-            loss_each[index] = loss.detach().cpu().numpy()
-    sorted_idx = np.argsort(loss_each)
+            loss_values[index] = loss.detach().cpu().numpy()
+    sorted_idx = np.argsort(loss_values)
     
     # GMM (split by clean probability)
-    gmm = GMM(n_components=2).fit(loss_each.reshape(-1,1))
-    prob = gmm.predict_proba(loss_each.reshape(-1,1))
+    gmm = GMM(n_components=2).fit(loss_values.reshape(-1,1))
+    prob = gmm.predict_proba(loss_values.reshape(-1,1))
     psuedo_clean_idx = prob[:,0] > np.max(prob[:,0]) - 0.04
     META_NUM = psuedo_clean_idx.sum()
 
     # split psuedo clean data
-    print('clean: ',META_NUM)
+    print('# of METADATA: ',META_NUM)
     if META_NUM > 4500:
-        idx_meta = sorted_idx[:4500]
-        idx_train = sorted_idx[4500:]
         META_NUM = 4500
-    else :
-        idx_meta = psuedo_clean_idx
-        idx_train = np.invert(psuedo_clean_idx)
+    num_meta_data_per_class = int(META_NUM/NUM_CLASSES)
+
+    for i in range(NUM_CLASSES):
+        idx_i = label_values == i
+        idx_i = np.where(idx_i == True)
+        loss_values_i = loss_values[idx_i]
+        sorted_idx = np.argsort(loss_values_i)
+        anchor_idx_i = np.take(idx_i, sorted_idx[:num_meta_data_per_class])
+        if idx_meta is None:
+            idx_meta = anchor_idx_i
+        else:
+            idx_meta = np.concatenate((idx_meta,anchor_idx_i))
+        print(len(idx_meta))
+    idx_train = np.setdiff1d(np.arange(NUM_TRAINDATA),np.array(idx_meta))
+
 
     t_dataset = torch.utils.data.Subset(train_dataset, idx_train)
     m_dataset = torch.utils.data.Subset(train_dataset, idx_meta)
-
+    
     m_dataset.dataset.transform = transforms.Compose([
         transforms.ToTensor(),
         transforms.RandomResizedCrop(32),
         transforms.RandomRotation(degrees=(-90, 90))
     ])
-    #print(len(t_dataset), len(m_dataset))
+    
+    print(len(t_dataset), len(m_dataset))
     t_dataloader = torch.utils.data.DataLoader(t_dataset,batch_size=BATCH_SIZE,shuffle=False, num_workers=num_workers)
     m_dataloader = torch.utils.data.DataLoader(m_dataset,batch_size=BATCH_SIZE,shuffle=False, num_workers=num_workers, drop_last=True)
 
     return t_dataset, m_dataset, t_dataloader, m_dataloader, idx_train
-
+'''
 def get_dataloaders_meta():
     NUM_TRAINDATA = len(train_dataset)
     num_meta_data_per_class = int(NUM_METADATA/NUM_CLASSES)
@@ -446,6 +460,20 @@ def get_dataloaders_meta():
             loss = c(output, labels)
             loss_values[index] = loss.detach().cpu().numpy()
             label_values[index] = labels.cpu().numpy()
+
+
+        # GMM (split by clean probability)
+        gmm = GMM(n_components=2).fit(loss_values.reshape(-1,1))
+        prob = gmm.predict_proba(loss_values.reshape(-1,1))
+        psuedo_clean_idx = prob[:,0] > np.max(prob[:,0]) - 0.04
+        META_NUM = psuedo_clean_idx.sum()
+
+        # split psuedo clean data
+        print('# of METADATA: ',META_NUM)
+        if META_NUM > 4500:
+            META_NUM = 4500
+        num_meta_data_per_class = int(META_NUM/NUM_CLASSES)
+
         for i in range(NUM_CLASSES):
             idx_i = label_values == i
             idx_i = np.where(idx_i == True)
@@ -459,13 +487,21 @@ def get_dataloaders_meta():
         idx_train = np.setdiff1d(np.arange(NUM_TRAINDATA),np.array(idx_meta))
     
     meta_len = len(idx_meta)
-    print(meta_len)
-    print(type(idx_meta), idx_meta)
-    print(noisy_idx[idx_meta].sum() / meta_len)
+    #print(noisy_idx[idx_meta].sum() / meta_len)
 
 
     t_dataset = torch.utils.data.Subset(train_dataset, idx_train)
     m_dataset = torch.utils.data.Subset(train_dataset, idx_meta)
+    ''' 
+    m_dataset.dataset.transform = transforms.Compose([
+        transforms.RandomCrop(32, padding=4),
+	    transforms.RandomHorizontalFlip(),
+	    transforms.ToTensor(),
+	    transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010))
+    ])
+    '''
+    m_dataset.dataset.transform = get_smalldata_transform_func('pytorch', 'cifar10')
+
     t_dataloader = torch.utils.data.DataLoader(t_dataset,batch_size=BATCH_SIZE,shuffle=False, num_workers=num_workers)
     m_dataloader = torch.utils.data.DataLoader(m_dataset,batch_size=BATCH_SIZE,shuffle=False, num_workers=num_workers, drop_last=True)
     return t_dataset, m_dataset, t_dataloader, m_dataloader
